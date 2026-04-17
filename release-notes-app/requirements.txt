@@ -1,0 +1,10 @@
+mars-cmbagent
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+sqlalchemy>=2.0.23
+pydantic>=2.5.0
+python-dotenv>=1.0.0
+structlog>=23.2.0
+openai>=1.6.0
+markdown>=3.5.0
+weasyprint>=60.0
