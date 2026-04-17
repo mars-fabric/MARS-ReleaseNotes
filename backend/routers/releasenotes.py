@@ -1495,13 +1495,16 @@ async def refine_stage_content(task_id: str, stage_num: int, request: ReleaseNot
 
     system_msg = (
         "You are an expert technical writer helping refine release documentation. "
-        "When the user asks you to modify the content, return ONLY the updated content "
-        "in the same format (Markdown). Do not add preamble, explanations, or sign-off text. "
-        "Preserve all existing structure and formatting unless the user asks to change it."
+        "IMPORTANT: Always return the COMPLETE document with the requested changes applied. "
+        "Do NOT return only the modified section — return the ENTIRE document from start to finish, "
+        "with the requested modifications incorporated in place. "
+        "Return the content in the same Markdown format. "
+        "Do not add preamble, explanations, or sign-off text. "
+        "Preserve all existing structure, sections, and formatting unless the user explicitly asks to change them."
     )
     user_msg = (
-        f"Here is the current document:\n\n{request.content}\n\n"
-        f"Please apply the following change:\n{request.message}"
+        f"Here is the FULL current document:\n\n{request.content}\n\n"
+        f"Please apply the following change and return the COMPLETE document with the change applied:\n{request.message}"
     )
 
     try:
