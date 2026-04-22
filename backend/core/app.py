@@ -33,7 +33,17 @@ async def lifespan(app: FastAPI):
     """App lifespan: re-apply logging after uvicorn overrides it."""
     configure_logging(**_log_config)
     import logging
-    logging.getLogger(__name__).info("Backend started, logs writing to %s", _log_config.get("log_file", "console"))
+    logger = logging.getLogger(__name__)
+    logger.info("Backend started, logs writing to %s", _log_config.get("log_file", "console"))
+
+    # Eagerly initialize the database so the first request isn't slow
+    try:
+        from cmbagent.database.base import init_database
+        init_database()
+        logger.info("Database initialized at startup")
+    except Exception as exc:
+        logger.warning("Database pre-init failed (will retry on first request): %s", exc)
+
     yield
 
 
