@@ -25,7 +25,6 @@ GET  /{task_id}/stages/{num}/console    → poll console output
 import asyncio
 import io
 import os
-import re
 import subprocess
 import sys
 import tempfile
@@ -56,115 +55,6 @@ from core.logging import get_logger
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/release-notes", tags=["Release Notes"])
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  Output cleaning helper
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _clean_stage_output(text: str) -> str:
-    """Strip LLM meta-commentary and code-block wrappers from stage output."""
-    if not text:
-        return text
-    # Remove ```python / ```markdown / ``` wrappers
-    text = re.sub(r'^```(?:python|markdown|md)?\s*\n', '', text, flags=re.MULTILINE)
-    text = re.sub(r'\n```\s*$', '', text, flags=re.MULTILINE)
-
-    # Strip everything before the first markdown heading (# ...)
-    # This removes LLM meta-commentary, file creation instructions, HTML tags, etc.
-    heading_match = re.search(r'^#{1,6}\s', text, re.MULTILINE)
-    if heading_match and heading_match.start() > 0:
-        text = text[heading_match.start():]
-
-    # Remove common LLM preamble lines (fallback if no heading found)
-    preamble_patterns = [
-        r'^(?:Here(?:\'s| is) (?:the|a|your) .*?:)\s*\n',
-        r'^(?:Below is .*?:)\s*\n',
-        r'^(?:I\'ve (?:generated|created|written) .*?:)\s*\n',
-        r'^(?:The following .*?:)\s*\n',
-        r'^(?:Sure[!,.].*?:)\s*\n',
-    ]
-    for pat in preamble_patterns:
-        text = re.sub(pat, '', text, count=1, flags=re.IGNORECASE)
-    # Remove trailing LLM sign-off
-    text = re.sub(r'\n(?:Let me know if .*|Feel free to .*|Is there anything .*|Hope this helps.*)$', '', text, flags=re.IGNORECASE)
-    return text.strip()
-
-
-def _recover_content_from_workdir(text: str, stage_work_dir: str) -> str:
-    """If extracted text is just meta-commentary (no markdown heading),
-    try to read the actual .md file written by the agent to the stage work dir.
-    Falls back to extracting markdown from tmp_code_*.py string literals."""
-    if not text or not stage_work_dir or not os.path.isdir(stage_work_dir):
-        return text
-    # If the text already has a markdown heading, it's real content
-    if re.search(r'^#{1,6}\s', text, re.MULTILINE):
-        return text
-
-    # 1) Scan the stage work dir for .md files (skip tmp_code_* files)
-    for fname in sorted(os.listdir(stage_work_dir)):
-        if fname.endswith('.md') and not fname.startswith('tmp_'):
-            fpath = os.path.join(stage_work_dir, fname)
-            try:
-                with open(fpath, 'r') as f:
-                    content = f.read()
-                cleaned = _clean_stage_output(content)
-                if cleaned and re.search(r'^#{1,6}\s', cleaned, re.MULTILINE):
-                    logger.info("recovered_content_from_file path=%s chars=%d", fpath, len(cleaned))
-                    return cleaned
-            except Exception:
-                continue
-
-    # 2) Also check data/ subdirectory
-    data_dir = os.path.join(stage_work_dir, "data")
-    if os.path.isdir(data_dir):
-        for fname in sorted(os.listdir(data_dir)):
-            if fname.endswith('.md'):
-                fpath = os.path.join(data_dir, fname)
-                try:
-                    with open(fpath, 'r') as f:
-                        content = f.read()
-                    cleaned = _clean_stage_output(content)
-                    if cleaned and re.search(r'^#{1,6}\s', cleaned, re.MULTILINE):
-                        logger.info("recovered_content_from_data path=%s chars=%d", fpath, len(cleaned))
-                        return cleaned
-                except Exception:
-                    continue
-
-    # 3) Extract markdown from tmp_code_*.py string literals
-    for fname in sorted(os.listdir(stage_work_dir)):
-        if fname.startswith('tmp_code_') and fname.endswith('.py'):
-            fpath = os.path.join(stage_work_dir, fname)
-            try:
-                with open(fpath, 'r') as f:
-                    py_content = f.read()
-                # The agent writes: content = '...\n# Heading\n...'
-                # Extract the string literal assigned to content/text variable
-                str_match = re.search(r"(?:content|text|markdown)\s*=\s*'(.*)", py_content, re.DOTALL)
-                if not str_match:
-                    str_match = re.search(r'(?:content|text|markdown)\s*=\s*"(.*)', py_content, re.DOTALL)
-                if str_match:
-                    raw = str_match.group(1)
-                    # Find matching closing quote
-                    # The string might end with '\nfilename = or '\nwith open(
-                    for end_pat in ["'\nfilename", "'\nwith open", "'\nf.write", "'\nos.", "'\n\n"]:
-                        end_idx = raw.find(end_pat)
-                        if end_idx > 0:
-                            raw = raw[:end_idx]
-                            break
-                    # Decode escape sequences
-                    try:
-                        decoded = raw.encode('utf-8').decode('unicode_escape')
-                    except Exception:
-                        decoded = raw.replace('\\n', '\n').replace("\\'", "'").replace('\\"', '"')
-                    cleaned = _clean_stage_output(decoded)
-                    if cleaned and len(cleaned) > 500 and re.search(r'^#{1,6}\s', cleaned, re.MULTILINE):
-                        logger.info("recovered_content_from_tmpcode path=%s chars=%d", fpath, len(cleaned))
-                        return cleaned
-            except Exception:
-                continue
-
-    return text
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -836,8 +726,6 @@ async def _run_analysis_one_shot(
             )
 
             text = helpers.extract_stage_result(result)
-            text = _clean_stage_output(text)
-            text = _recover_content_from_workdir(text, stage_work_dir)
             file_path = helpers.save_stage_file(text, work_dir, doc_file)
 
             results_map[doc_key] = text
@@ -930,8 +818,6 @@ async def _run_release_notes_one_shot(
         sys.stderr = original_stderr
 
     text = helpers.extract_stage_result(result)
-    text = _clean_stage_output(text)
-    text = _recover_content_from_workdir(text, stage_work_dir)
     file_path = helpers.save_stage_file(text, work_dir, "release_notes.md")
 
     with _console_lock:
@@ -1014,8 +900,6 @@ async def _run_migration_one_shot(
         sys.stderr = original_stderr
 
     text = helpers.extract_stage_result(result)
-    text = _clean_stage_output(text)
-    text = _recover_content_from_workdir(text, stage_work_dir)
     file_path = helpers.save_stage_file(text, work_dir, "migration_script.md")
 
     with _console_lock:
@@ -1397,35 +1281,27 @@ async def get_stage_content(task_id: str, stage_num: int):
         content = None
         shared = None
         documents = None
-        work_dir = None
         if stage.output_data:
             shared = stage.output_data.get("shared")
             sdef = STAGE_DEFS[stage_num - 1]
-
-            # Resolve work_dir for content recovery
-            from cmbagent.database.models import WorkflowRun
-            parent = db.query(WorkflowRun).filter(WorkflowRun.id == task_id).first()
-            work_dir = (parent.meta or {}).get("work_dir", _get_work_dir(task_id)) if parent else _get_work_dir(task_id)
-            stage_work_dir = os.path.join(work_dir, f"stage_{stage_num}_{sdef['name']}")
 
             # Multi-document stages (analysis)
             if sdef.get("multi_doc") and shared:
                 documents = {}
                 for key in sdef["doc_keys"]:
-                    val = _clean_stage_output(shared.get(key, ""))
-                    sub_dir = os.path.join(work_dir, f"stage_{stage_num}_{key}")
-                    documents[key] = _recover_content_from_workdir(val, sub_dir)
-                content = _clean_stage_output(shared.get(sdef["shared_key"]) or "")
-                content = _recover_content_from_workdir(content, stage_work_dir)
+                    documents[key] = shared.get(key, "")
+                content = shared.get(sdef["shared_key"])
             elif sdef["shared_key"] and shared:
-                content = _clean_stage_output(shared.get(sdef["shared_key"]) or "")
-                content = _recover_content_from_workdir(content, stage_work_dir)
+                content = shared.get(sdef["shared_key"])
 
             if not content and sdef.get("file"):
-                fp = os.path.join(work_dir, "input_files", sdef["file"])
+                from cmbagent.database.models import WorkflowRun
+                parent = db.query(WorkflowRun).filter(WorkflowRun.id == task_id).first()
+                wd = (parent.meta or {}).get("work_dir", _get_work_dir(task_id)) if parent else _get_work_dir(task_id)
+                fp = os.path.join(wd, "input_files", sdef["file"])
                 if os.path.exists(fp):
                     with open(fp, "r") as f:
-                        content = _clean_stage_output(f.read())
+                        content = f.read()
 
         return ReleaseNotesStageContentResponse(
             stage_number=stage.stage_number, stage_name=stage.stage_name,
@@ -1493,30 +1369,24 @@ async def refine_stage_content(task_id: str, stage_num: int, request: ReleaseNot
     """LLM refine for stage content."""
     import concurrent.futures
 
-    system_msg = (
-        "You are an expert technical writer helping refine release documentation. "
-        "IMPORTANT: Always return the COMPLETE document with the requested changes applied. "
-        "Do NOT return only the modified section — return the ENTIRE document from start to finish, "
-        "with the requested modifications incorporated in place. "
-        "Return the content in the same Markdown format. "
-        "Do not add preamble, explanations, or sign-off text. "
-        "Preserve all existing structure, sections, and formatting unless the user explicitly asks to change them."
-    )
-    user_msg = (
-        f"Here is the FULL current document:\n\n{request.content}\n\n"
-        f"Please apply the following change and return the COMPLETE document with the change applied:\n{request.message}"
+    prompt = (
+        "You are helping a software engineer refine release documentation. "
+        "Below is the COMPLETE current document, followed by the user's edit request.\n\n"
+        f"--- CURRENT CONTENT ---\n{request.content}\n\n"
+        f"--- USER REQUEST ---\n{request.message}\n\n"
+        "IMPORTANT: Return the ENTIRE document with the requested changes applied. "
+        "Do NOT omit any sections. Even if the user's request only targets a specific section, "
+        "you must return the full document with that section refined and all other sections intact. "
+        "Return ONLY the refined document content, no explanations or commentary."
     )
 
     try:
         def _call_llm():
             from cmbagent.llm_provider import safe_completion
             return safe_completion(
-                messages=[
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": user_msg},
-                ],
+                messages=[{"role": "user", "content": prompt}],
                 model="gpt-4o",
-                temperature=0.4,
+                temperature=0.7,
                 max_tokens=16384,
             )
 
@@ -1526,7 +1396,6 @@ async def refine_stage_content(task_id: str, stage_num: int, request: ReleaseNot
 
         return ReleaseNotesRefineResponse(refined_content=refined or request.content)
     except Exception as e:
-        logger.error("Refinement failed", task_id=task_id, stage=stage_num, error=str(e))
         raise HTTPException(status_code=500, detail=f"Refinement failed: {str(e)}")
 
 

@@ -1,4 +1,4 @@
-# Release Notes Generator
+# MARS Release Notes
 
 AI-powered release notes generation from git diffs using GPT-4o.
 
@@ -12,8 +12,6 @@ AI-powered release notes generation from git diffs using GPT-4o.
 ### 1. Backend Setup
 
 ```bash
-cd release-notes-app
-
 # Create virtual environment
 python -m venv venv
 source venv/bin/activate
@@ -22,7 +20,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 
 # Configure environment
-cp .env .env.local  # Edit with your Azure OpenAI credentials
+cp .env.example .env  # Edit with your Azure OpenAI credentials
 # Required: AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_DEPLOYMENT
 
 # Run backend
@@ -60,11 +58,33 @@ Frontend runs on `http://localhost:3008`.
 
 Each step supports editing, preview, save, PDF export, and AI-powered refinement.
 
+## Project Structure
+
+```
+MARS-ReleaseNotes/
+├── backend/                # FastAPI backend
+│   ├── __main__.py         # Entry point (python -m backend)
+│   ├── main.py             # App bootstrap & router registration
+│   ├── core/               # App factory, config, logging
+│   ├── models/             # Pydantic schemas
+│   ├── routers/            # API endpoints
+│   ├── services/           # Session management
+│   └── execution/          # Cost tracking
+├── frontend/               # Next.js 14 frontend
+│   ├── app/                # App Router pages & layout
+│   ├── components/         # UI components
+│   ├── hooks/              # React hooks
+│   ├── lib/                # Config & fetch utilities
+│   └── types/              # TypeScript types
+├── requirements.txt        # Python dependencies
+└── .env                    # Environment variables
+```
+
 ## Architecture
 
-- **Frontend**: Next.js 14 (App Router, TypeScript)
+- **Frontend**: Next.js 14 (App Router, TypeScript, Tailwind CSS)
 - **Backend**: FastAPI (async, SQLAlchemy + SQLite)
-- **LLM**: OpenAI GPT-4o (+ Azure OpenAI support)
+- **LLM**: Azure OpenAI GPT-4o
 - **PDF**: WeasyPrint + Python markdown
 - **Icons**: Lucide React
 
