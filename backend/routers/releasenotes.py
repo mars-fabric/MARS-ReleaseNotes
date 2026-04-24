@@ -25,6 +25,7 @@ GET  /{task_id}/stages/{num}/console    → poll console output
 import asyncio
 import io
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -55,6 +56,24 @@ from core.logging import get_logger
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/release-notes", tags=["Release Notes"])
+
+
+# ─── Helper: strip Python code wrappers from LLM output ──────────────────
+_PYTHON_WRAPPER_RE = re.compile(
+    r'(?:^.*?```(?:python)?\s*\n)?'       # optional ```python preamble
+    r'.*?content\s*=\s*"""(.*?)"""'        # content = """..."""
+    r'|.*?content\s*=\s*\'\'\'(.*?)\'\'\'',  # content = '''...'''
+    re.DOTALL,
+)
+
+def _strip_python_wrapper(text: str) -> str:
+    """Remove Python code wrappers the LLM sometimes adds around markdown."""
+    m = _PYTHON_WRAPPER_RE.search(text)
+    if m:
+        extracted = (m.group(1) or m.group(2) or "").strip()
+        if len(extracted) > 100:
+            return extracted
+    return text
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -484,7 +503,7 @@ async def _run_planning_control_stage(
       7. Close callback DB session
     """
     from cmbagent.callbacks import merge_callbacks, create_print_callbacks, WorkflowCallbacks
-    from cmbagent.task_framework import releasenotes_helpers as helpers
+    from backend.task_framework import releasenotes_helpers as helpers
 
     # ── Phase 1: Set up DB session for cost + event tracking ──
     db = _get_db()
@@ -677,7 +696,7 @@ async def _run_analysis_one_shot(
     Matches the Deepresearch pattern with unified stdout/stderr capture
     and callback injection into each agent call.
     """
-    from cmbagent.task_framework.prompts.releasenotes.analysis import (
+    from backend.task_framework.prompts.releasenotes.analysis import (
         base_researcher_prompt, head_researcher_prompt, comparison_researcher_prompt,
     )
 
@@ -726,6 +745,7 @@ async def _run_analysis_one_shot(
             )
 
             text = helpers.extract_stage_result(result)
+            text = _strip_python_wrapper(text)
             file_path = helpers.save_stage_file(text, work_dir, doc_file)
 
             results_map[doc_key] = text
@@ -759,7 +779,7 @@ async def _run_release_notes_one_shot(
 
     Unified stdout/stderr capture with callback injection.
     """
-    from cmbagent.task_framework.prompts.releasenotes.release_notes import (
+    from backend.task_framework.prompts.releasenotes.release_notes import (
         release_notes_researcher_prompt,
     )
 
@@ -818,6 +838,7 @@ async def _run_release_notes_one_shot(
         sys.stderr = original_stderr
 
     text = helpers.extract_stage_result(result)
+    text = _strip_python_wrapper(text)
     file_path = helpers.save_stage_file(text, work_dir, "release_notes.md")
 
     with _console_lock:
@@ -837,7 +858,7 @@ async def _run_migration_one_shot(
 
     Unified stdout/stderr capture with callback injection.
     """
-    from cmbagent.task_framework.prompts.releasenotes.migration import (
+    from backend.task_framework.prompts.releasenotes.migration import (
         migration_researcher_prompt,
     )
 
@@ -900,6 +921,7 @@ async def _run_migration_one_shot(
         sys.stderr = original_stderr
 
     text = helpers.extract_stage_result(result)
+    text = _strip_python_wrapper(text)
     file_path = helpers.save_stage_file(text, work_dir, "migration_script.md")
 
     with _console_lock:
