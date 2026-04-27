@@ -82,7 +82,7 @@ export const WIZARD_STEP_TO_STAGE: Record<number, number | null> = {
 export const STAGE_SHARED_KEYS: Record<number, string> = {
   1: 'diff_context',
   2: 'analysis_comparison',
-  3: 'release_notes',
+  3: 'release_notes_commercial',
   4: 'migration_script',
 }
 
@@ -93,3 +93,10 @@ export const ANALYSIS_DOC_KEYS = [
 ] as const
 
 export type AnalysisDocKey = typeof ANALYSIS_DOC_KEYS[number]['key']
+
+export const RELEASE_NOTES_DOC_KEYS = [
+  { key: 'release_notes_commercial', label: 'Commercial Release Notes', file: 'release_notes_commercial.md' },
+  { key: 'release_notes_developer', label: 'Developer Release Notes', file: 'release_notes_developer.md' },
+] as const
+
+export type ReleaseNotesDocKey = typeof RELEASE_NOTES_DOC_KEYS[number]['key']

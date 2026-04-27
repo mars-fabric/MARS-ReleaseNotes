@@ -385,7 +385,13 @@ export default function Home() {
                         </button>
                       </div>
                       <div className="text-[11px] mt-0.5" style={{ color: 'var(--mars-color-text-tertiary)' }}>
-                        {task.current_stage ? `Stage ${task.current_stage}: ${STAGE_LABELS[task.current_stage] || ''}` : 'Setup'}
+                        {task.current_stage
+                          ? `Stage ${task.current_stage}: ${STAGE_LABELS[task.current_stage] || ''}`
+                          : task.status === 'completed'
+                            ? 'Completed'
+                            : task.status === 'failed'
+                              ? 'Failed'
+                              : 'Setup'}
                       </div>
 
                       {/* Progress bar */}

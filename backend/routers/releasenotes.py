@@ -123,7 +123,9 @@ STAGE_DEFS = [
     {"number": 2, "name": "analysis",         "shared_key": "analysis_comparison", "file": "analysis_comparison.md",
      "multi_doc": True, "doc_keys": ["analysis_base", "analysis_head", "analysis_comparison"],
      "doc_files": ["analysis_base.md", "analysis_head.md", "analysis_comparison.md"]},
-    {"number": 3, "name": "release_notes",    "shared_key": "release_notes", "file": "release_notes.md"},
+    {"number": 3, "name": "release_notes",    "shared_key": "release_notes_commercial", "file": "release_notes_commercial.md",
+     "multi_doc": True, "doc_keys": ["release_notes_commercial", "release_notes_developer"],
+     "doc_files": ["release_notes_commercial.md", "release_notes_developer.md"]},
     {"number": 4, "name": "migration",         "shared_key": "migration_script", "file": "migration_script.md"},
     {"number": 5, "name": "package",          "shared_key": None,           "file": None},
 ]
@@ -255,6 +257,50 @@ def _validate_repo_url(url: str) -> str:
     return url
 
 
+def _validate_repo_and_branches(repo_url: str, base: str, head: str, token: str = None):
+    """Verify the repo is accessible and both branches exist using git ls-remote."""
+    check_url = repo_url
+    if token:
+        check_url = repo_url.replace("https://", f"https://{token}@")
+
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", "--heads", check_url],
+            capture_output=True, text=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=408, detail="Repository check timed out. The repo may be too large or unreachable.")
+
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if "not found" in stderr.lower() or "repository" in stderr.lower():
+            raise HTTPException(status_code=404, detail=f"Repository not found or not accessible: {repo_url}")
+        raise HTTPException(status_code=400, detail=f"Cannot access repository: {stderr}")
+
+    # Parse branch names from ls-remote output
+    remote_branches = set()
+    for line in result.stdout.strip().splitlines():
+        if line.strip():
+            parts = line.split("\t")
+            if len(parts) == 2:
+                ref = parts[1]
+                if ref.startswith("refs/heads/"):
+                    remote_branches.add(ref[len("refs/heads/"):])
+
+    missing = []
+    if base not in remote_branches:
+        missing.append(f"base branch '{base}'")
+    if head not in remote_branches:
+        missing.append(f"head branch '{head}'")
+
+    if missing:
+        available = ", ".join(sorted(remote_branches)[:20]) if remote_branches else "(none)"
+        raise HTTPException(
+            status_code=400,
+            detail=f"Branch not found: {', '.join(missing)}. Available branches: {available}",
+        )
+
+
 def _categorise_file(filepath: str) -> str:
     lower = filepath.lower()
     for cat, patterns in FILE_CATEGORIES.items():
@@ -289,6 +335,9 @@ async def create_release_notes_task(request: ReleaseNotesCreateRequest):
         raise HTTPException(status_code=400, detail="Both branches are required.")
     if base == head:
         raise HTTPException(status_code=400, detail="Branches must be different.")
+
+    # Verify repo is accessible and both branches exist before creating the task
+    _validate_repo_and_branches(repo_url, base, head, token=request.auth_token)
 
     repo_name = repo_url.rstrip("/").split("/")[-1]
     task_id = str(uuid.uuid4())
@@ -818,20 +867,20 @@ async def _run_release_notes_one_shot(
     shared_state: Dict[str, Any], config_overrides: Dict[str, Any],
     helpers, callbacks=None,
 ) -> Dict[str, Any]:
-    """Stage 3: single one_shot call — commercial + developer release notes.
+    """Stage 3: two separate one_shot calls — commercial + developer release notes.
 
-    Unified stdout/stderr capture with callback injection.
+    Each document gets its own AI call for better quality and reliability.
+    Follows the same pattern as Stage 2 (analysis) with sequential calls.
     """
     from backend.task_framework.prompts.releasenotes.release_notes import (
-        release_notes_researcher_prompt,
+        release_notes_commercial_researcher_prompt,
+        release_notes_developer_researcher_prompt,
     )
 
     extra = shared_state.get("extra_instructions", "")
     extra_section = f"## Additional Instructions\n{extra}" if extra else ""
 
-    # The release notes stage has 3 analysis documents that summarize the
-    # diff. Truncate the raw diff_context to keep the prompt manageable
-    # and avoid expensive compaction retries + slow LLM rounds.
+    # Truncate raw diff_context — analysis docs already summarize it
     diff_context = shared_state.get("diff_context", "")
     if len(diff_context) > 20_000:
         marker = "## Full Diff"
@@ -845,7 +894,7 @@ async def _run_release_notes_one_shot(
         else:
             diff_context = diff_context[:20_000] + "\n\n... [diff truncated for performance]\n"
 
-    # Truncate analysis documents if very large to avoid hitting context limits
+    # Truncate analysis documents if very large
     MAX_ANALYSIS_CHARS = 30_000
     analysis_base = shared_state.get("analysis_base", "")
     analysis_head = shared_state.get("analysis_head", "")
@@ -858,7 +907,7 @@ async def _run_release_notes_one_shot(
     if len(analysis_comparison) > MAX_ANALYSIS_CHARS:
         analysis_comparison = analysis_comparison[:MAX_ANALYSIS_CHARS] + "\n\n... [truncated for performance]\n"
 
-    task_prompt = release_notes_researcher_prompt.format(
+    fmt_kwargs = dict(
         repo_name=shared_state.get("repo_name", "repository"),
         base_branch=shared_state.get("base_branch", ""),
         head_branch=shared_state.get("head_branch", ""),
@@ -869,19 +918,18 @@ async def _run_release_notes_one_shot(
         extra_instructions_section=extra_section,
     )
 
-    prompt_len = len(task_prompt)
-    with _console_lock:
-        _console_buffers.setdefault(buf_key, []).append(
-            "Generating release notes (commercial + developer)..."
-        )
-        _console_buffers[buf_key].append(
-            f"Prompt size: {prompt_len:,} chars — calling AI model (this may take a few minutes)..."
-        )
+    doc_specs = [
+        ("release_notes_commercial", "release_notes_commercial.md", "Commercial Release Notes",
+         release_notes_commercial_researcher_prompt.format(**fmt_kwargs)),
+        ("release_notes_developer", "release_notes_developer.md", "Developer Release Notes",
+         release_notes_developer_researcher_prompt.format(**fmt_kwargs)),
+    ]
 
-    stage_work_dir = os.path.join(work_dir, "stage_3_release_notes")
-    os.makedirs(stage_work_dir, exist_ok=True)
+    results_map: Dict[str, str] = {}
+    artifacts: Dict[str, str] = {}
+    chat_histories: Dict[str, list] = {}
 
-    # Unified stdout/stderr capture
+    # Unified stdout/stderr capture for entire stage
     original_stdout, original_stderr = sys.stdout, sys.stderr
     capture_out = _ConsoleCapture(buf_key, original_stdout)
     capture_err = _ConsoleCapture(buf_key, original_stderr)
@@ -889,31 +937,54 @@ async def _run_release_notes_one_shot(
     try:
         sys.stdout = capture_out
         sys.stderr = capture_err
-        result = await asyncio.to_thread(
-            _run_one_shot_sync, task_prompt, "researcher",
-            stage_work_dir, config_overrides, callbacks,
-        )
+
+        for i, (doc_key, doc_file, label, task_prompt) in enumerate(doc_specs):
+            with _console_lock:
+                _console_buffers.setdefault(buf_key, []).append(
+                    f"Running release notes document {i+1}/2: {label}..."
+                )
+                _console_buffers[buf_key].append(
+                    f"Prompt size: {len(task_prompt):,} chars — calling AI model..."
+                )
+
+            stage_work_dir = os.path.join(work_dir, f"stage_3_{doc_key}")
+            os.makedirs(stage_work_dir, exist_ok=True)
+
+            result = await asyncio.to_thread(
+                _run_one_shot_sync, task_prompt, "researcher",
+                stage_work_dir, config_overrides, callbacks,
+            )
+
+            text = helpers.extract_stage_result(result)
+            text = _strip_python_wrapper(text)
+
+            # Fallback: scan work_dir if extraction got a file-write message
+            if len(text.strip()) < 100 or "written to" in text.lower():
+                recovered = _scan_work_dir_for_content(stage_work_dir)
+                if recovered and len(recovered) > len(text):
+                    text = recovered
+
+            file_path = helpers.save_stage_file(text, work_dir, doc_file)
+
+            results_map[doc_key] = text
+            artifacts[doc_key] = file_path
+            chat_histories[doc_key] = result.get("chat_history", [])
+
+            with _console_lock:
+                _console_buffers.setdefault(buf_key, []).append(
+                    f"Document {i+1}/2 ({label}) complete — {len(text)} chars"
+                )
+
     finally:
         sys.stdout = original_stdout
         sys.stderr = original_stderr
 
-    text = helpers.extract_stage_result(result)
-    text = _strip_python_wrapper(text)
-
-    # Fallback: scan work_dir if extraction got a file-write message
-    if len(text.strip()) < 100 or "written to" in text.lower():
-        recovered = _scan_work_dir_for_content(stage_work_dir)
-        if recovered and len(recovered) > len(text):
-            text = recovered
-
-    file_path = helpers.save_stage_file(text, work_dir, "release_notes.md")
-
-    with _console_lock:
-        _console_buffers.setdefault(buf_key, []).append(
-            f"Release notes complete — {len(text)} chars"
-        )
-
-    return helpers.build_release_notes_output(text, file_path, result.get("chat_history", []))
+    return helpers.build_release_notes_output(
+        results_map["release_notes_commercial"],
+        results_map["release_notes_developer"],
+        artifacts,
+        chat_histories,
+    )
 
 
 async def _run_migration_one_shot(
@@ -1027,8 +1098,8 @@ async def _run_collect_and_diff(shared_state: Dict[str, Any], work_dir: str, buf
             _console_buffers.setdefault(buf_key, []).append(f"Cloning {repo_url}...")
 
         result = subprocess.run(
-            ["git", "clone", "--no-single-branch", "--depth=100", "--branch", head, clone_url, tmp_dir],
-            capture_output=True, text=True, timeout=180,
+            ["git", "clone", "--single-branch", "--depth=100", "--branch", head, clone_url, tmp_dir],
+            capture_output=True, text=True, timeout=600,
         )
         if result.returncode != 0:
             raise RuntimeError(f"Clone failed: {result.stderr.strip()}")
@@ -1036,7 +1107,7 @@ async def _run_collect_and_diff(shared_state: Dict[str, Any], work_dir: str, buf
         with _console_lock:
             _console_buffers.setdefault(buf_key, []).append("Fetching base branch...")
 
-        r = _run_git(["fetch", "origin", base, "--depth=100"], cwd=tmp_dir)
+        r = _run_git(["fetch", "origin", f"+refs/heads/{base}:refs/remotes/origin/{base}", "--depth=100"], cwd=tmp_dir)
         if r.returncode != 0:
             raise RuntimeError(f"Failed to fetch base: {r.stderr.strip()}")
 
@@ -1093,9 +1164,8 @@ async def _run_collect_and_diff(shared_state: Dict[str, Any], work_dir: str, buf
 
     try:
         data = await asyncio.to_thread(_do)
-    except Exception:
+    finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise
 
     repo_name = shared_state.get("repo_name", "repository")
     diff_context = (
@@ -1146,7 +1216,8 @@ async def _run_package(task_id: str, shared_state: Dict[str, Any], buf_key: str)
         ("analysis_base", "analysis_base.md", "Last Release Branch Analysis"),
         ("analysis_head", "analysis_head.md", "Current Release Branch Analysis"),
         ("analysis_comparison", "analysis_comparison.md", "Detailed Comparison Report"),
-        ("release_notes", "release_notes.md", "Release Notes"),
+        ("release_notes_commercial", "release_notes_commercial.md", "Commercial Release Notes"),
+        ("release_notes_developer", "release_notes_developer.md", "Developer Release Notes"),
         ("migration_script", "migration_script.md", "Migration Script"),
     ]
     for key, filename, label in artifact_map:
@@ -1179,8 +1250,8 @@ async def _run_package(task_id: str, shared_state: Dict[str, Any], buf_key: str)
         "commit_count": shared_state.get("commit_count", 0),
         "file_count": shared_state.get("file_count", 0),
         "has_analysis": bool(shared_state.get("analysis_base")),
-        "has_release_notes": bool(shared_state.get("release_notes")),
-        "has_code_guide": bool(shared_state.get("release_notes_code")),
+        "has_release_notes": bool(shared_state.get("release_notes_commercial")),
+        "has_developer_notes": bool(shared_state.get("release_notes_developer")),
         "has_migration_script": bool(shared_state.get("migration_script")),
         "migration_type": shared_state.get("migration_type"),
         "artifacts": artifacts,
@@ -1873,6 +1944,8 @@ async def download_all_artifacts(task_id: str):
         meta = parent.meta or {}
         wd = meta.get("work_dir", _get_work_dir(task_id))
         repo_name = meta.get("repo_name", "release-notes")
+        base_branch = meta.get("base_branch", "")
+        head_branch = meta.get("head_branch", "")
     finally:
         db.close()
 
@@ -1885,12 +1958,48 @@ async def download_all_artifacts(task_id: str):
         "analysis_base.md",
         "analysis_head.md",
         "analysis_comparison.md",
-        "release_notes.md",
+        "release_notes_commercial.md",
+        "release_notes_developer.md",
         "migration_script.md",
     ]
 
-    zip_name = f"{repo_name}_release_notes_package.zip"
+    # Build zip filename with branch names (sanitize for filesystem safety)
+    def _sanitize(s: str) -> str:
+        return re.sub(r'[^\w\-.]', '_', s)
+
+    if base_branch and head_branch:
+        zip_name = f"{repo_name}_{_sanitize(base_branch)}_to_{_sanitize(head_branch)}_release_notes_package.zip"
+    else:
+        zip_name = f"{repo_name}_release_notes_package.zip"
     zip_path = os.path.join(wd, zip_name)
+
+    # Generate PDFs for all markdown artifacts before zipping
+    try:
+        import markdown as md_lib
+        from weasyprint import HTML
+
+        for md_fname in artifact_files:
+            md_fp = os.path.join(input_dir, md_fname)
+            if os.path.exists(md_fp):
+                pdf_fname = md_fname.replace(".md", ".pdf")
+                pdf_fp = os.path.join(input_dir, pdf_fname)
+                if not os.path.exists(pdf_fp):
+                    with open(md_fp, "r") as f:
+                        md_content = f.read()
+                    html_body = md_lib.markdown(
+                        md_content,
+                        extensions=["tables", "fenced_code", "codehilite", "toc", "sane_lists"],
+                    )
+                    full_html = (
+                        f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                        f"<style>{_PDF_CSS}</style></head>"
+                        f"<body>{html_body}</body></html>"
+                    )
+                    pdf_bytes = HTML(string=full_html).write_pdf()
+                    with open(pdf_fp, "wb") as f:
+                        f.write(pdf_bytes)
+    except Exception as exc:
+        logger.warning("download_all_pdf_generation_failed error=%s", exc)
 
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for fname in artifact_files:
@@ -1898,7 +2007,7 @@ async def download_all_artifacts(task_id: str):
             if os.path.exists(fp):
                 zf.write(fp, fname)
 
-        # Also include PDF versions if they exist
+        # Include all PDF versions
         for fname in os.listdir(input_dir):
             if fname.endswith(".pdf"):
                 fp = os.path.join(input_dir, fname)
@@ -1939,7 +2048,8 @@ async def get_package_info(task_id: str):
             {"key": "analysis_base", "filename": "analysis_base.md", "label": "Last Release Branch Analysis", "stage_num": 2},
             {"key": "analysis_head", "filename": "analysis_head.md", "label": "Current Release Branch Analysis", "stage_num": 2},
             {"key": "analysis_comparison", "filename": "analysis_comparison.md", "label": "Detailed Comparison Report", "stage_num": 2},
-            {"key": "release_notes", "filename": "release_notes.md", "label": "Release Notes", "stage_num": 3},
+            {"key": "release_notes_commercial", "filename": "release_notes_commercial.md", "label": "Commercial Release Notes", "stage_num": 3},
+            {"key": "release_notes_developer", "filename": "release_notes_developer.md", "label": "Developer Release Notes", "stage_num": 3},
             {"key": "migration_script", "filename": "migration_script.md", "label": "Migration Script", "stage_num": 4},
         ]
 

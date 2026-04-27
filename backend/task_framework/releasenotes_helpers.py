@@ -289,19 +289,28 @@ def build_release_notes_kwargs(
 
 
 def build_release_notes_output(
-    release_notes_text: str,
-    file_path: str,
-    chat_history: list,
+    commercial_text: str,
+    developer_text: str,
+    artifacts: Dict[str, str],
+    chat_histories: Dict[str, list],
 ) -> dict:
-    """Build output_data for DB storage (release notes stage)."""
+    """Build output_data for DB storage (release notes stage — 2 documents)."""
     return {
         "shared": {
-            "release_notes": release_notes_text,
+            "release_notes_commercial": commercial_text,
+            "release_notes_developer": developer_text,
+            # Keep a combined key for downstream stages (migration) that
+            # reference "release_notes" in shared_state.
+            "release_notes": (
+                "# Commercial Release Notes\n\n" + commercial_text +
+                "\n\n---\n\n# Developer Release Notes\n\n" + developer_text
+            ),
         },
-        "artifacts": {
-            "release_notes": file_path,
-        },
-        "chat_history": chat_history,
+        "artifacts": artifacts,
+        "documents": [
+            {"key": "release_notes_commercial", "file": "release_notes_commercial.md", "label": "Commercial Release Notes"},
+            {"key": "release_notes_developer", "file": "release_notes_developer.md", "label": "Developer Release Notes"},
+        ],
     }
 
 

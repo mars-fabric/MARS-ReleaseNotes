@@ -31,8 +31,13 @@ function escapeHtml(text: string): string {
 }
 
 function renderMarkdown(md: string): string {
+  // Strip HTML comments (LLM sometimes adds <!-- filename: ... --> hints)
+  let cleaned = md.replace(/<!--[\s\S]*?-->/g, '')
+  // Also strip already-escaped HTML comment variants
+  cleaned = cleaned.replace(/&lt;!--[\s\S]*?--&gt;/g, '')
+
   let html = ''
-  const lines = md.split('\n')
+  const lines = cleaned.split('\n')
   let inCodeBlock = false
   let codeBlockContent = ''
   let codeBlockLang = ''

@@ -33,8 +33,9 @@ import {
   WIZARD_STEP_TO_STAGE,
   STAGE_SHARED_KEYS,
   ANALYSIS_DOC_KEYS,
+  RELEASE_NOTES_DOC_KEYS,
 } from '@/types/releasenotes'
-import type { ReleaseNotesWizardStep, RefinementMessage, AnalysisDocKey } from '@/types/releasenotes'
+import type { ReleaseNotesWizardStep, RefinementMessage, AnalysisDocKey, ReleaseNotesDocKey } from '@/types/releasenotes'
 
 // ─── Props ──────────────────────────────────────────────────────────────
 
@@ -233,13 +234,10 @@ export default function ReleaseNotesTask({ onBack, resumeTaskId }: ReleaseNotesT
           />
         )}
 
-        {/* Step 3: Release Notes (review panel — editable) */}
+        {/* Step 3: Release Notes (2-document tabbed panel) */}
         {currentStep === 3 && (
-          <ReviewStagePanel
+          <ReleaseNotesStagePanel
             hook={hook}
-            stageNum={3}
-            stageName="Release Notes"
-            sharedKey="release_notes"
             onNext={goNext}
             onBack={goBack}
           />
@@ -945,6 +943,272 @@ function ReviewStagePanel({ hook, stageNum, stageName, sharedKey, onNext, onBack
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+//  Release Notes Stage Panel (2-document tabbed view: Commercial + Developer)
+// ═══════════════════════════════════════════════════════════════════════
+
+interface ReleaseNotesStagePanelProps {
+  hook: ReturnType<typeof useReleaseNotesTask>
+  onNext: () => void
+  onBack: () => void
+}
+
+function ReleaseNotesStagePanel({ hook, onNext, onBack }: ReleaseNotesStagePanelProps) {
+  const {
+    taskId,
+    taskState,
+    stageDocuments,
+    editableContent,
+    setEditableContent,
+    setStageDocuments,
+    refinementMessages,
+    consoleOutput,
+    isExecuting,
+    executeStage,
+    fetchStageContent,
+    saveStageContent,
+    refineContent,
+  } = hook
+
+  const [activeTab, setActiveTab] = useState<ReleaseNotesDocKey>('release_notes_commercial')
+  const [mode, setMode] = useState<'edit' | 'preview'>('edit')
+  const [isSaving, setIsSaving] = useState(false)
+  const [saveIndicator, setSaveIndicator] = useState<'idle' | 'saving' | 'saved'>('idle')
+  const [contentLoaded, setContentLoaded] = useState(false)
+  const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const stage = taskState?.stages.find(s => s.stage_number === 3)
+  const isStageCompleted = stage?.status === 'completed'
+  const isStageRunning = stage?.status === 'running' || isExecuting
+  const isStageNotStarted = stage?.status === 'pending'
+  const isStageFailed = stage?.status === 'failed'
+
+  useEffect(() => {
+    if ((isStageCompleted || isStageFailed) && !contentLoaded) {
+      fetchStageContent(3).then(() => setContentLoaded(true))
+    }
+  }, [isStageCompleted, isStageFailed, contentLoaded, fetchStageContent])
+
+  // When tab changes, switch the editable content to the selected doc
+  useEffect(() => {
+    if (stageDocuments && stageDocuments[activeTab] !== undefined) {
+      setEditableContent(stageDocuments[activeTab])
+    }
+  }, [activeTab, stageDocuments, setEditableContent])
+
+  const hasContent = contentLoaded && (stageDocuments !== null)
+
+  const handleSave = useCallback(async () => {
+    setIsSaving(true)
+    setSaveIndicator('saving')
+    if (stageDocuments) {
+      setStageDocuments({ ...stageDocuments, [activeTab]: editableContent })
+    }
+    await saveStageContent(3, editableContent, activeTab)
+    setIsSaving(false)
+    setSaveIndicator('saved')
+    if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current)
+    saveTimeoutRef.current = setTimeout(() => setSaveIndicator('idle'), 2000)
+  }, [editableContent, activeTab, stageDocuments, saveStageContent, setStageDocuments])
+
+  const handleRefine = useCallback(async (message: string): Promise<string | null> => {
+    const result = await refineContent(3, message, editableContent)
+    return result
+  }, [editableContent, refineContent])
+
+  const handleApplyRefinement = useCallback((content: string) => {
+    if (!content || !content.trim()) return
+    setEditableContent(content)
+    if (stageDocuments) {
+      setStageDocuments({ ...stageDocuments, [activeTab]: content })
+    }
+  }, [setEditableContent, stageDocuments, activeTab, setStageDocuments])
+
+  const handleDownload = useCallback((docKey: string) => {
+    if (!taskId) return
+    const url = getApiUrl(`/api/release-notes/${taskId}/stages/3/download?doc_key=${docKey}`)
+    window.open(url, '_blank')
+  }, [taskId])
+
+  const handleDownloadAll = useCallback(() => {
+    if (!taskId) return
+    RELEASE_NOTES_DOC_KEYS.forEach(({ key }) => {
+      const url = getApiUrl(`/api/release-notes/${taskId}/stages/3/download?doc_key=${key}`)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = ''
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+    })
+  }, [taskId])
+
+  // Pre-execution state
+  if (isStageNotStarted && !isExecuting) {
+    return (
+      <div className="max-w-full mx-auto space-y-3">
+        <div className="flex items-center justify-between py-2">
+          <span className="text-sm font-semibold" style={{ color: 'var(--mars-color-text)' }}>
+            Release Notes
+          </span>
+        </div>
+        <p className="text-sm" style={{ color: 'var(--mars-color-text-secondary)' }}>
+          Run the AI agent to produce 2 release notes documents: Commercial Release Notes for
+          end-users and Developer Release Notes for engineering teams.
+        </p>
+        <div className="flex items-center gap-3 pt-2">
+          <Button onClick={onBack} variant="secondary" size="sm">
+            <ArrowLeft className="w-3.5 h-3.5 mr-1" /> Back
+          </Button>
+          <Button onClick={() => executeStage(3)} variant="primary" size="sm">
+            <Play className="w-3.5 h-3.5 mr-1" /> Run Release Notes
+          </Button>
+        </div>
+      </div>
+    )
+  }
+
+  // Running state
+  if (isStageRunning && !hasContent) {
+    return (
+      <div className="max-w-full mx-auto space-y-4">
+        <ExecutionProgress
+          consoleOutput={consoleOutput}
+          isExecuting={true}
+          stageName="Release Notes"
+        />
+      </div>
+    )
+  }
+
+  const activeDocInfo = RELEASE_NOTES_DOC_KEYS.find(d => d.key === activeTab)
+
+  // Content view — 2 tabs
+  return (
+    <div className="max-w-full mx-auto space-y-4">
+      {/* Toolbar */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-semibold" style={{ color: 'var(--mars-color-text)' }}>
+            Release Notes
+          </span>
+          {saveIndicator === 'saving' && (
+            <span className="text-xs" style={{ color: 'var(--mars-color-text-tertiary)' }}>Saving...</span>
+          )}
+          {saveIndicator === 'saved' && (
+            <span className="text-xs" style={{ color: 'var(--mars-color-accent)' }}>Saved</span>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          <Button onClick={handleDownloadAll} variant="secondary" size="sm">
+            <Download className="w-3.5 h-3.5 mr-1" /> Download All
+          </Button>
+          <Button
+            onClick={() => setMode(mode === 'edit' ? 'preview' : 'edit')}
+            variant="secondary"
+            size="sm"
+          >
+            {mode === 'edit' ? <Eye className="w-3.5 h-3.5 mr-1" /> : <Edit3 className="w-3.5 h-3.5 mr-1" />}
+            {mode === 'edit' ? 'Preview' : 'Edit'}
+          </Button>
+          <Button onClick={handleSave} variant="secondary" size="sm" disabled={isSaving}>
+            <Save className="w-3.5 h-3.5 mr-1" /> Save
+          </Button>
+        </div>
+      </div>
+
+      {/* Tabs */}
+      <div
+        className="flex border-b"
+        style={{ borderColor: 'var(--mars-color-border)' }}
+      >
+        {RELEASE_NOTES_DOC_KEYS.map(({ key, label }) => (
+          <button
+            key={key}
+            onClick={() => setActiveTab(key as ReleaseNotesDocKey)}
+            className="px-4 py-2.5 text-sm font-medium transition-colors relative"
+            style={{
+              color: activeTab === key ? 'var(--mars-color-accent)' : 'var(--mars-color-text-secondary)',
+              borderBottom: activeTab === key ? '2px solid var(--mars-color-accent)' : '2px solid transparent',
+            }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      <div className="flex gap-4" style={{ minHeight: 400 }}>
+        {/* Editor / Preview */}
+        <div
+          className="flex-1 rounded-mars-md border overflow-auto"
+          style={{ borderColor: 'var(--mars-color-border)' }}
+        >
+          {mode === 'edit' ? (
+            <textarea
+              value={editableContent}
+              onChange={(e) => setEditableContent(e.target.value)}
+              className="w-full h-full min-h-[400px] p-4 text-sm font-mono resize-none outline-none"
+              style={{
+                backgroundColor: 'var(--mars-color-surface)',
+                color: 'var(--mars-color-text)',
+              }}
+            />
+          ) : (
+            <div className="p-4">
+              <MarkdownRenderer content={editableContent || ''} />
+            </div>
+          )}
+        </div>
+
+        {/* Right sidebar: download + refinement */}
+        <div
+          className="w-72 flex-shrink-0 rounded-mars-md border flex flex-col"
+          style={{ borderColor: 'var(--mars-color-border)', backgroundColor: 'var(--mars-color-surface)', maxHeight: 420 }}
+        >
+          {/* Download for current tab */}
+          <div
+            className="px-3 py-2 border-b flex items-center justify-between"
+            style={{ borderColor: 'var(--mars-color-border)' }}
+          >
+            <span className="text-xs font-medium" style={{ color: 'var(--mars-color-text-secondary)' }}>
+              {activeDocInfo?.label}
+            </span>
+            <Button
+              onClick={() => handleDownload(activeTab)}
+              variant="secondary"
+              size="sm"
+            >
+              <Download className="w-3 h-3 mr-1" /> Download
+            </Button>
+          </div>
+
+          <div
+            className="px-3 py-2 text-xs font-medium border-b"
+            style={{ color: 'var(--mars-color-text-secondary)', borderColor: 'var(--mars-color-border)' }}
+          >
+            AI Refinement
+          </div>
+          <InlineRefinementChat
+            messages={refinementMessages}
+            onSend={handleRefine}
+            onApply={handleApplyRefinement}
+          />
+        </div>
+      </div>
+
+      {/* Navigation */}
+      <div className="flex items-center gap-3 pt-2">
+        <Button onClick={onBack} variant="secondary" size="sm">
+          <ArrowLeft className="w-3.5 h-3.5 mr-1" /> Back
+        </Button>
+        <Button onClick={onNext} variant="primary" size="sm">
+          Next <ArrowRight className="w-3.5 h-3.5 ml-1" />
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 //  Migration Panel (auto-executes, then displays generated scripts)
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -1082,10 +1346,6 @@ function MigrationPanel({ hook, onNext, onBack }: MigrationPanelProps) {
                 ) : (
                   <><Edit3 className="w-3.5 h-3.5 mr-1" /> Edit</>
                 )}
-              </Button>
-              <Button onClick={handleSave} variant="primary" size="sm" disabled={isSaving}>
-                <Save className="w-3.5 h-3.5 mr-1" />
-                {saveIndicator === 'saving' ? 'Saving...' : saveIndicator === 'saved' ? 'Saved!' : 'Save'}
               </Button>
             </div>
           </div>
