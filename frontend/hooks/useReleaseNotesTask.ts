@@ -175,6 +175,9 @@ export function useReleaseNotesTask(): UseReleaseNotesTaskReturn {
     setIsExecuting(true)
     setError(null)
     setConsoleOutput([])
+    setEditableContent('')
+    setStageDocuments(null)
+    setRefinementMessages([])
 
     try {
       await apiFetch(`/api/release-notes/${id}/stages/${stageNum}/execute`, {
@@ -315,7 +318,10 @@ export function useReleaseNotesTask(): UseReleaseNotesTaskReturn {
     fetchStageContent,
     saveStageContent,
     refineContent,
-    setCurrentStep: setCurrentStep as (step: ReleaseNotesWizardStep) => void,
+    setCurrentStep: ((step: ReleaseNotesWizardStep) => {
+      setCurrentStep(step)
+      setRefinementMessages([])
+    }) as (step: ReleaseNotesWizardStep) => void,
     setEditableContent,
     setStageDocuments,
     resumeTask,

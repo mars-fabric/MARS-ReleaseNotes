@@ -134,15 +134,33 @@ function renderMarkdown(md: string): string {
 
 function inlineMarkdown(text: string): string {
   let result = escapeHtml(text)
-  // Bold
+
+  // Process inline code FIRST — extract code spans so they aren't
+  // affected by bold/italic transforms.  Replace with placeholders,
+  // apply formatting, then restore.
+  const codeSpans: string[] = []
+  result = result.replace(/`(.+?)`/g, (_match, code) => {
+    codeSpans.push(`<code>${code}</code>`)
+    return `\x00CODE${codeSpans.length - 1}\x00`
+  })
+
+  // Bold (must come before italic)
   result = result.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
   result = result.replace(/__(.+?)__/g, '<strong>$1</strong>')
-  // Italic
+
+  // Italic with asterisks (safe — always treated as emphasis)
   result = result.replace(/\*(.+?)\*/g, '<em>$1</em>')
-  result = result.replace(/_(.+?)_/g, '<em>$1</em>')
-  // Inline code
-  result = result.replace(/`(.+?)`/g, '<code>$1</code>')
+
+  // Italic with underscores — only when underscores are at word boundaries,
+  // NOT in the middle of words/filenames like some_file_name.py
+  // Requires whitespace or start/end of string around the underscores
+  result = result.replace(/(^|[\s(])_([^_]+?)_([\s),.:;!?]|$)/g, '$1<em>$2</em>$3')
+
   // Links [text](url)
   result = result.replace(/\[(.+?)\]\((.+?)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+
+  // Restore code spans
+  result = result.replace(/\x00CODE(\d+)\x00/g, (_match, idx) => codeSpans[parseInt(idx)])
+
   return result
 }

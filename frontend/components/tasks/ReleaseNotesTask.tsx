@@ -16,6 +16,10 @@ import {
   Upload,
   Download,
   Database,
+  FileText,
+  Package,
+  DollarSign,
+  CheckCircle2,
 } from 'lucide-react'
 import { Button } from '@/components/core'
 import Stepper from '@/components/core/Stepper'
@@ -252,11 +256,8 @@ export default function ReleaseNotesTask({ onBack, resumeTaskId }: ReleaseNotesT
 
         {/* Step 5: Package */}
         {currentStep === 5 && (
-          <ExecutionStagePanel
+          <PackagePanel
             hook={hook}
-            stageNum={5}
-            stageName="Package"
-            description="Bundle all outputs into the final package."
             onBack={goBack}
           />
         )}
@@ -522,7 +523,7 @@ function AnalysisStagePanel({ hook, onNext, onBack }: AnalysisStagePanelProps) {
     }
   }, [activeTab, stageDocuments, setEditableContent])
 
-  const hasContent = isStageCompleted || isStageFailed || (stageDocuments !== null)
+  const hasContent = contentLoaded && (stageDocuments !== null)
 
   const handleSave = useCallback(async () => {
     setIsSaving(true)
@@ -782,7 +783,8 @@ function ReviewStagePanel({ hook, stageNum, stageName, sharedKey, onNext, onBack
     }
   }, [isStageCompleted, isStageFailed, contentLoaded, fetchStageContent, stageNum])
 
-  const hasContent = isStageCompleted || isStageFailed || (editableContent && editableContent.length > 0)
+  // Content is available only when we've loaded it for THIS stage
+  const hasContent = contentLoaded && (editableContent?.length > 0)
 
   const handleSave = useCallback(async () => {
     setIsSaving(true)
@@ -1131,6 +1133,260 @@ function MigrationPanel({ hook, onNext, onBack }: MigrationPanelProps) {
             onApply={handleApplyRefinement}
           />
         </div>
+      </div>
+    </div>
+  )
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Package Panel — final stage with artifacts, cost & downloads
+// ═══════════════════════════════════════════════════════════════════════
+
+interface PackagePanelProps {
+  hook: ReturnType<typeof useReleaseNotesTask>
+  onBack: () => void
+}
+
+interface PackageArtifact {
+  key: string
+  filename: string
+  label: string
+  stage_num: number
+  available: boolean
+}
+
+interface PackageInfo {
+  task_id: string
+  repo_name: string
+  artifacts: PackageArtifact[]
+  total_cost_usd: number | null
+  completed_stages: number
+  total_stages: number
+}
+
+function PackagePanel({ hook, onBack }: PackagePanelProps) {
+  const { taskId, taskState, consoleOutput, isExecuting, executeStage } = hook
+  const [packageInfo, setPackageInfo] = useState<PackageInfo | null>(null)
+  const [loadingInfo, setLoadingInfo] = useState(false)
+
+  const stage = taskState?.stages.find(s => s.stage_number === 5)
+  const isCompleted = stage?.status === 'completed'
+  const isFailed = stage?.status === 'failed'
+  const isNotStarted = stage?.status === 'pending'
+
+  // Load package info once package stage completes
+  useEffect(() => {
+    if (isCompleted && taskId && !packageInfo) {
+      setLoadingInfo(true)
+      fetch(getApiUrl(`/api/release-notes/${taskId}/package-info`))
+        .then(r => r.ok ? r.json() : null)
+        .then(data => { if (data) setPackageInfo(data) })
+        .catch(() => {})
+        .finally(() => setLoadingInfo(false))
+    }
+  }, [isCompleted, taskId, packageInfo])
+
+  const handleDownloadMd = useCallback((artifact: PackageArtifact) => {
+    if (!taskId) return
+    const url = getApiUrl(
+      `/api/release-notes/${taskId}/stages/${artifact.stage_num}/download?doc_key=${artifact.key}`
+    )
+    window.open(url, '_blank')
+  }, [taskId])
+
+  const handleDownloadPdf = useCallback((artifact: PackageArtifact) => {
+    if (!taskId) return
+    const url = getApiUrl(
+      `/api/release-notes/${taskId}/stages/${artifact.stage_num}/download-pdf?doc_key=${artifact.key}`
+    )
+    window.open(url, '_blank')
+  }, [taskId])
+
+  const handleDownloadAll = useCallback(() => {
+    if (!taskId) return
+    const url = getApiUrl(`/api/release-notes/${taskId}/download-all`)
+    window.open(url, '_blank')
+  }, [taskId])
+
+  // Pre-execution state
+  if (isNotStarted && !isExecuting) {
+    return (
+      <div className="max-w-full mx-auto space-y-3">
+        <div className="flex items-center justify-between py-2">
+          <span className="text-sm font-semibold" style={{ color: 'var(--mars-color-text)' }}>
+            Package
+          </span>
+        </div>
+        <p className="text-sm" style={{ color: 'var(--mars-color-text-secondary)' }}>
+          Bundle all outputs into the final package.
+        </p>
+        <div className="flex items-center gap-3 pt-2">
+          <Button onClick={onBack} variant="secondary" size="sm">
+            <ArrowLeft className="w-3.5 h-3.5 mr-1" /> Back
+          </Button>
+          <Button onClick={() => executeStage(5)} variant="primary" size="sm">
+            <Play className="w-3.5 h-3.5 mr-1" /> Run Package
+          </Button>
+        </div>
+      </div>
+    )
+  }
+
+  // Running state
+  if (isExecuting || (!isCompleted && !isFailed)) {
+    return (
+      <div className="max-w-full mx-auto space-y-4">
+        <ExecutionProgress
+          consoleOutput={consoleOutput}
+          isExecuting={isExecuting}
+          stageName="Package"
+        />
+      </div>
+    )
+  }
+
+  // Failed state
+  if (isFailed) {
+    return (
+      <div className="max-w-full mx-auto space-y-4">
+        <ExecutionProgress
+          consoleOutput={consoleOutput}
+          isExecuting={false}
+          stageName="Package"
+        />
+        <div className="flex items-center gap-3 pt-2">
+          <Button onClick={onBack} variant="secondary" size="sm">
+            <ArrowLeft className="w-3.5 h-3.5 mr-1" /> Back
+          </Button>
+          <Button onClick={() => executeStage(5)} variant="secondary" size="sm">
+            <Play className="w-3.5 h-3.5 mr-1" /> Retry
+          </Button>
+        </div>
+      </div>
+    )
+  }
+
+  // Completed state — show artifacts + cost
+  return (
+    <div className="max-w-full mx-auto space-y-6">
+      {/* Success banner */}
+      <div
+        className="rounded-mars-md border p-4 flex items-center gap-3"
+        style={{
+          backgroundColor: 'rgba(34,197,94,0.08)',
+          borderColor: 'rgba(34,197,94,0.3)',
+        }}
+      >
+        <CheckCircle2 className="w-6 h-6 flex-shrink-0" style={{ color: '#22c55e' }} />
+        <div>
+          <h3 className="text-base font-semibold" style={{ color: 'var(--mars-color-text)' }}>
+            Release Notes Complete
+          </h3>
+          <p className="text-sm" style={{ color: 'var(--mars-color-text-secondary)' }}>
+            All {packageInfo?.completed_stages ?? 5} stages completed successfully.
+          </p>
+        </div>
+      </div>
+
+      {/* Generated Artifacts */}
+      <div>
+        <h3 className="text-sm font-semibold mb-3" style={{ color: 'var(--mars-color-text)' }}>
+          Generated Artifacts
+        </h3>
+        <div className="space-y-2">
+          {loadingInfo ? (
+            <div className="flex items-center gap-2 py-4 justify-center">
+              <Loader2 className="w-4 h-4 animate-spin" style={{ color: 'var(--mars-color-primary)' }} />
+              <span className="text-sm" style={{ color: 'var(--mars-color-text-secondary)' }}>Loading artifacts...</span>
+            </div>
+          ) : packageInfo?.artifacts && packageInfo.artifacts.length > 0 ? (
+            packageInfo.artifacts.map((artifact) => (
+              <div
+                key={artifact.key}
+                className="flex items-center justify-between rounded-mars-md border px-4 py-3"
+                style={{
+                  backgroundColor: 'var(--mars-color-surface)',
+                  borderColor: 'var(--mars-color-border)',
+                }}
+              >
+                <div className="flex items-center gap-3">
+                  <FileText className="w-5 h-5 flex-shrink-0" style={{ color: 'var(--mars-color-text-tertiary)' }} />
+                  <span className="text-sm font-medium" style={{ color: 'var(--mars-color-text)' }}>
+                    {artifact.label}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => handleDownloadMd(artifact)}
+                    className="flex items-center gap-1 px-2.5 py-1.5 rounded-mars-sm text-xs font-medium transition-colors hover:opacity-80"
+                    style={{ color: 'var(--mars-color-accent)' }}
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    Markdown
+                  </button>
+                  <button
+                    onClick={() => handleDownloadPdf(artifact)}
+                    className="flex items-center gap-1 px-2.5 py-1.5 rounded-mars-sm text-xs font-medium transition-colors hover:opacity-80"
+                    style={{ color: 'var(--mars-color-accent)' }}
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    PDF
+                  </button>
+                </div>
+              </div>
+            ))
+          ) : (
+            <p className="text-sm py-2" style={{ color: 'var(--mars-color-text-tertiary)' }}>
+              No artifacts found.
+            </p>
+          )}
+        </div>
+      </div>
+
+      {/* Download All */}
+      {packageInfo?.artifacts && packageInfo.artifacts.length > 0 && (
+        <div>
+          <Button onClick={handleDownloadAll} variant="primary" size="md" className="w-full">
+            <Download className="w-4 h-4 mr-2" />
+            Download All as ZIP
+          </Button>
+        </div>
+      )}
+
+      {/* Cost Summary */}
+      <div
+        className="rounded-mars-md border p-4"
+        style={{
+          backgroundColor: 'var(--mars-color-surface)',
+          borderColor: 'var(--mars-color-border)',
+        }}
+      >
+        <h3 className="text-sm font-semibold mb-3" style={{ color: 'var(--mars-color-text)' }}>
+          Cost Summary
+        </h3>
+        <div className="flex items-center gap-8">
+          <div>
+            <p className="text-xs" style={{ color: 'var(--mars-color-text-tertiary)' }}>Total Cost</p>
+            <p className="text-xl font-bold" style={{ color: 'var(--mars-color-text)' }}>
+              {packageInfo?.total_cost_usd != null
+                ? `$${packageInfo.total_cost_usd.toFixed(4)}`
+                : '—'}
+            </p>
+          </div>
+          <div>
+            <p className="text-xs" style={{ color: 'var(--mars-color-text-tertiary)' }}>Stages</p>
+            <p className="text-xl font-bold" style={{ color: 'var(--mars-color-text)' }}>
+              {packageInfo?.completed_stages ?? '—'}/{packageInfo?.total_stages ?? '—'}
+            </p>
+          </div>
+        </div>
+      </div>
+
+      {/* Back button */}
+      <div className="flex items-center gap-3 pt-2">
+        <Button onClick={onBack} variant="secondary" size="sm">
+          <ArrowLeft className="w-3.5 h-3.5 mr-1" /> Back
+        </Button>
       </div>
     </div>
   )

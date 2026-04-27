@@ -405,6 +405,18 @@ def build_migration_output(
 # accepted as valid stage output.
 _NONE_SENTINELS = frozenset({"None", "none", "NONE", "null", "NULL", "TERMINATE"})
 
+# Patterns that indicate a meta-message about file writing rather than
+# actual document content.  The LLM sometimes returns these instead of
+# the real content.
+_FILE_WRITTEN_PATTERNS = [
+    "has been successfully written to",
+    "content has been written to",
+    "file has been saved to",
+    "saved to the file",
+    "written to the file",
+    "in the working directory:",
+]
+
 
 def _is_meaningful(text: str | None) -> bool:
     """Return True if *text* looks like genuine agent output."""
@@ -418,6 +430,12 @@ def _is_meaningful(text: str | None) -> bool:
     # Very short responses (< 20 chars) that aren't content-like are suspect
     if len(stripped) < 20 and stripped.replace('.', '').replace('!', '').strip() in _NONE_SENTINELS:
         return False
+    # Reject "file written" meta-messages — these are LLM artifacts, not content
+    lower = stripped.lower()
+    if len(stripped) < 1000:
+        for pattern in _FILE_WRITTEN_PATTERNS:
+            if pattern in lower:
+                return False
     return True
 
 
@@ -426,6 +444,7 @@ def extract_stage_result(results: dict) -> str:
 
     Tries researcher and formatter agents first, then falls back to
     scanning all messages for the longest non-empty content.
+    If the LLM wrote files to the work_dir, reads those as a last resort.
     """
     chat_history = results["chat_history"]
 
@@ -452,6 +471,11 @@ def extract_stage_result(results: dict) -> str:
         if best:
             task_result = best
 
+    # If still no result, check if the LLM wrote a file to the work_dir
+    # and read it (the chat might contain a path reference)
+    if not task_result:
+        task_result = _try_read_llm_written_file(chat_history)
+
     if not task_result:
         agent_names = [msg.get("name", "<no name>") for msg in chat_history if msg.get("name")]
         raise ValueError(
@@ -459,6 +483,46 @@ def extract_stage_result(results: dict) -> str:
         )
 
     return extract_clean_markdown(task_result)
+
+
+def _try_read_llm_written_file(chat_history: list) -> str:
+    """If the LLM wrote content to a file, find and read that file."""
+    import re
+    for msg in reversed(chat_history):
+        content = msg.get("content") or ""
+        lower = content.lower()
+        # Check if this message mentions writing a file
+        is_write_msg = any(p in lower for p in _FILE_WRITTEN_PATTERNS)
+        if not is_write_msg:
+            continue
+        # Try to extract file paths from the message
+        paths = re.findall(r'(/[^\s<>"\']+\.(?:md|txt|py|sh))', content)
+        for path in paths:
+            if os.path.isfile(path):
+                try:
+                    with open(path, 'r') as f:
+                        file_content = f.read()
+                    if file_content.strip() and len(file_content.strip()) > 50:
+                        logger.info("Recovered content from LLM-written file: %s", path)
+                        return file_content
+                except Exception:
+                    continue
+        # Also check for just filenames (relative) with a working directory path
+        dir_paths = re.findall(r'(/[^\s<>"\']+/)', content)
+        file_names = re.findall(r'([a-zA-Z0-9_-]+\.(?:md|txt|py|sh))', content)
+        for dpath in dir_paths:
+            for fname in file_names:
+                full = os.path.join(dpath.strip(), fname.strip())
+                if os.path.isfile(full):
+                    try:
+                        with open(full, 'r') as f:
+                            file_content = f.read()
+                        if file_content.strip() and len(file_content.strip()) > 50:
+                            logger.info("Recovered content from LLM-written file: %s", full)
+                            return file_content
+                    except Exception:
+                        continue
+    return ""
 
 
 def save_stage_file(content: str, work_dir: str, filename: str) -> str:

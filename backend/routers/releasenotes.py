@@ -76,6 +76,44 @@ def _strip_python_wrapper(text: str) -> str:
     return text
 
 
+def _scan_work_dir_for_content(stage_work_dir: str) -> str:
+    """Scan a stage work directory for .md files the LLM may have written directly.
+
+    Returns the content of the largest .md file found, or empty string.
+    """
+    best = ""
+    for root, _dirs, files in os.walk(stage_work_dir):
+        for fname in files:
+            if fname.endswith((".md", ".txt")):
+                fp = os.path.join(root, fname)
+                try:
+                    with open(fp, "r") as f:
+                        content = f.read()
+                    if len(content.strip()) > len(best):
+                        best = content.strip()
+                except Exception:
+                    continue
+    return best
+
+
+_FILE_WRITE_PATTERNS = [
+    "has been successfully written to",
+    "content has been written to",
+    "file has been saved to",
+    "saved to the file",
+    "written to the file",
+    "in the working directory:",
+]
+
+
+def _is_file_write_message(text: str) -> bool:
+    """Check if text is a meta-message about file writing rather than actual content."""
+    if not text or len(text) > 1000:
+        return False
+    lower = text.lower()
+    return any(p in lower for p in _FILE_WRITE_PATTERNS)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Stage definitions
 # ═══════════════════════════════════════════════════════════════════════════
@@ -85,9 +123,7 @@ STAGE_DEFS = [
     {"number": 2, "name": "analysis",         "shared_key": "analysis_comparison", "file": "analysis_comparison.md",
      "multi_doc": True, "doc_keys": ["analysis_base", "analysis_head", "analysis_comparison"],
      "doc_files": ["analysis_base.md", "analysis_head.md", "analysis_comparison.md"]},
-    {"number": 3, "name": "release_notes",    "shared_key": "release_notes", "file": "release_notes.md",
-     "multi_doc": True, "doc_keys": ["release_notes_commercial", "release_notes_developer", "release_notes_code"],
-     "doc_files": ["release_notes_commercial.md", "release_notes_developer.md", "release_notes_code.py"]},
+    {"number": 3, "name": "release_notes",    "shared_key": "release_notes", "file": "release_notes.md"},
     {"number": 4, "name": "migration",         "shared_key": "migration_script", "file": "migration_script.md"},
     {"number": 5, "name": "package",          "shared_key": None,           "file": None},
 ]
@@ -746,6 +782,13 @@ async def _run_analysis_one_shot(
 
             text = helpers.extract_stage_result(result)
             text = _strip_python_wrapper(text)
+
+            # Fallback: scan work_dir if extraction got a file-write message
+            if len(text.strip()) < 100 or "written to" in text.lower():
+                recovered = _scan_work_dir_for_content(stage_work_dir)
+                if recovered and len(recovered) > len(text):
+                    text = recovered
+
             file_path = helpers.save_stage_file(text, work_dir, doc_file)
 
             results_map[doc_key] = text
@@ -802,20 +845,37 @@ async def _run_release_notes_one_shot(
         else:
             diff_context = diff_context[:20_000] + "\n\n... [diff truncated for performance]\n"
 
+    # Truncate analysis documents if very large to avoid hitting context limits
+    MAX_ANALYSIS_CHARS = 30_000
+    analysis_base = shared_state.get("analysis_base", "")
+    analysis_head = shared_state.get("analysis_head", "")
+    analysis_comparison = shared_state.get("analysis_comparison", "")
+
+    if len(analysis_base) > MAX_ANALYSIS_CHARS:
+        analysis_base = analysis_base[:MAX_ANALYSIS_CHARS] + "\n\n... [truncated for performance]\n"
+    if len(analysis_head) > MAX_ANALYSIS_CHARS:
+        analysis_head = analysis_head[:MAX_ANALYSIS_CHARS] + "\n\n... [truncated for performance]\n"
+    if len(analysis_comparison) > MAX_ANALYSIS_CHARS:
+        analysis_comparison = analysis_comparison[:MAX_ANALYSIS_CHARS] + "\n\n... [truncated for performance]\n"
+
     task_prompt = release_notes_researcher_prompt.format(
         repo_name=shared_state.get("repo_name", "repository"),
         base_branch=shared_state.get("base_branch", ""),
         head_branch=shared_state.get("head_branch", ""),
         diff_context=diff_context,
-        analysis_base=shared_state.get("analysis_base", ""),
-        analysis_head=shared_state.get("analysis_head", ""),
-        analysis_comparison=shared_state.get("analysis_comparison", ""),
+        analysis_base=analysis_base,
+        analysis_head=analysis_head,
+        analysis_comparison=analysis_comparison,
         extra_instructions_section=extra_section,
     )
 
+    prompt_len = len(task_prompt)
     with _console_lock:
         _console_buffers.setdefault(buf_key, []).append(
             "Generating release notes (commercial + developer)..."
+        )
+        _console_buffers[buf_key].append(
+            f"Prompt size: {prompt_len:,} chars — calling AI model (this may take a few minutes)..."
         )
 
     stage_work_dir = os.path.join(work_dir, "stage_3_release_notes")
@@ -839,6 +899,13 @@ async def _run_release_notes_one_shot(
 
     text = helpers.extract_stage_result(result)
     text = _strip_python_wrapper(text)
+
+    # Fallback: scan work_dir if extraction got a file-write message
+    if len(text.strip()) < 100 or "written to" in text.lower():
+        recovered = _scan_work_dir_for_content(stage_work_dir)
+        if recovered and len(recovered) > len(text):
+            text = recovered
+
     file_path = helpers.save_stage_file(text, work_dir, "release_notes.md")
 
     with _console_lock:
@@ -922,6 +989,14 @@ async def _run_migration_one_shot(
 
     text = helpers.extract_stage_result(result)
     text = _strip_python_wrapper(text)
+
+    # Fallback: if extracted text is too short or looks like a file-write message,
+    # scan the stage work_dir for .md files the LLM may have written directly
+    if len(text.strip()) < 100 or "written to" in text.lower():
+        recovered = _scan_work_dir_for_content(stage_work_dir)
+        if recovered and len(recovered) > len(text):
+            text = recovered
+
     file_path = helpers.save_stage_file(text, work_dir, "migration_script.md")
 
     with _console_lock:
@@ -1061,9 +1136,40 @@ async def _run_collect_and_diff(shared_state: Dict[str, Any], work_dir: str, buf
 
 
 async def _run_package(task_id: str, shared_state: Dict[str, Any], buf_key: str) -> Dict[str, Any]:
-    """Stage 5: Bundle all outputs."""
+    """Stage 5: Bundle all outputs and collect cost summary."""
     with _console_lock:
         _console_buffers.setdefault(buf_key, []).append("Assembling output package...")
+
+    # Collect artifact availability
+    artifacts = []
+    artifact_map = [
+        ("analysis_base", "analysis_base.md", "Last Release Branch Analysis"),
+        ("analysis_head", "analysis_head.md", "Current Release Branch Analysis"),
+        ("analysis_comparison", "analysis_comparison.md", "Detailed Comparison Report"),
+        ("release_notes", "release_notes.md", "Release Notes"),
+        ("migration_script", "migration_script.md", "Migration Script"),
+    ]
+    for key, filename, label in artifact_map:
+        if shared_state.get(key):
+            artifacts.append({"key": key, "filename": filename, "label": label, "stage": _artifact_stage(key)})
+
+    # Collect cost from DB
+    total_cost_usd = None
+    stage_count = 0
+    try:
+        db = _get_db()
+        try:
+            session_id = _get_session_id_for_task(task_id, db)
+            cost_repo = _get_cost_repo(db, session_id=session_id)
+            cost_info = cost_repo.get_task_total_cost(parent_run_id=task_id)
+            total_cost_usd = cost_info.get("total_cost_usd")
+            repo = _get_stage_repo(db, session_id=session_id)
+            stages = repo.list_stages(parent_run_id=task_id)
+            stage_count = sum(1 for s in stages if s.status == "completed")
+        finally:
+            db.close()
+    except Exception:
+        pass
 
     package = {
         "task_id": task_id,
@@ -1073,16 +1179,30 @@ async def _run_package(task_id: str, shared_state: Dict[str, Any], buf_key: str)
         "commit_count": shared_state.get("commit_count", 0),
         "file_count": shared_state.get("file_count", 0),
         "has_analysis": bool(shared_state.get("analysis_base")),
-        "has_release_notes": bool(shared_state.get("release_notes_commercial")),
+        "has_release_notes": bool(shared_state.get("release_notes")),
         "has_code_guide": bool(shared_state.get("release_notes_code")),
         "has_migration_script": bool(shared_state.get("migration_script")),
         "migration_type": shared_state.get("migration_type"),
+        "artifacts": artifacts,
+        "total_cost_usd": total_cost_usd,
+        "completed_stages": stage_count,
     }
 
     with _console_lock:
         _console_buffers.setdefault(buf_key, []).append("Output package assembled.")
 
     return {"shared": {}, "package": package}
+
+
+def _artifact_stage(key: str) -> int:
+    """Map shared_state key to stage number."""
+    mapping = {
+        "analysis_base": 2, "analysis_head": 2, "analysis_comparison": 2,
+        "release_notes": 3, "release_notes_commercial": 3,
+        "release_notes_developer": 3, "release_notes_code": 3,
+        "migration_script": 4,
+    }
+    return mapping.get(key, 0)
 
 
 
@@ -1307,23 +1427,55 @@ async def get_stage_content(task_id: str, stage_num: int):
             shared = stage.output_data.get("shared")
             sdef = STAGE_DEFS[stage_num - 1]
 
+            from cmbagent.database.models import WorkflowRun
+            parent = db.query(WorkflowRun).filter(WorkflowRun.id == task_id).first()
+            wd = (parent.meta or {}).get("work_dir", _get_work_dir(task_id)) if parent else _get_work_dir(task_id)
+
             # Multi-document stages (analysis)
             if sdef.get("multi_doc") and shared:
                 documents = {}
                 for key in sdef["doc_keys"]:
-                    documents[key] = shared.get(key, "")
+                    doc_text = shared.get(key, "")
+                    # If stored content is a file-write message, try file fallback
+                    if doc_text and _is_file_write_message(doc_text):
+                        doc_text = ""
+                    documents[key] = doc_text
                 content = shared.get(sdef["shared_key"])
+                if content and _is_file_write_message(content):
+                    content = None
             elif sdef["shared_key"] and shared:
                 content = shared.get(sdef["shared_key"])
+                # If stored content is a file-write message, treat as missing
+                if content and _is_file_write_message(content):
+                    content = None
 
+            # File fallback for single-doc content
             if not content and sdef.get("file"):
-                from cmbagent.database.models import WorkflowRun
-                parent = db.query(WorkflowRun).filter(WorkflowRun.id == task_id).first()
-                wd = (parent.meta or {}).get("work_dir", _get_work_dir(task_id)) if parent else _get_work_dir(task_id)
                 fp = os.path.join(wd, "input_files", sdef["file"])
                 if os.path.exists(fp):
                     with open(fp, "r") as f:
                         content = f.read()
+                # Last resort: scan the stage work directories for LLM-written files
+                if not content or _is_file_write_message(content):
+                    for sub in [f"stage_{stage_num}_migration", f"stage_{stage_num}_{sdef['name']}"]:
+                        scan_dir = os.path.join(wd, sub)
+                        if os.path.isdir(scan_dir):
+                            recovered = _scan_work_dir_for_content(scan_dir)
+                            if recovered and len(recovered) > 100:
+                                content = recovered
+                                break
+
+            # File fallback for multi-doc entries
+            if sdef.get("multi_doc") and documents:
+                key_to_file = dict(zip(sdef["doc_keys"], sdef["doc_files"]))
+                for key in sdef["doc_keys"]:
+                    if not documents.get(key):
+                        fname = key_to_file.get(key)
+                        if fname:
+                            fp = os.path.join(wd, "input_files", fname)
+                            if os.path.exists(fp):
+                                with open(fp, "r") as f:
+                                    documents[key] = f.read()
 
         return ReleaseNotesStageContentResponse(
             stage_number=stage.stage_number, stage_name=stage.stage_name,
@@ -1391,6 +1543,11 @@ async def refine_stage_content(task_id: str, stage_num: int, request: ReleaseNot
     """LLM refine for stage content."""
     import concurrent.futures
 
+    if not request.content or not request.content.strip():
+        raise HTTPException(status_code=400, detail="Content is required for refinement")
+    if not request.message or not request.message.strip():
+        raise HTTPException(status_code=400, detail="Refinement message is required")
+
     prompt = (
         "You are helping a software engineer refine release documentation. "
         "Below is the COMPLETE current document, followed by the user's edit request.\n\n"
@@ -1399,7 +1556,8 @@ async def refine_stage_content(task_id: str, stage_num: int, request: ReleaseNot
         "IMPORTANT: Return the ENTIRE document with the requested changes applied. "
         "Do NOT omit any sections. Even if the user's request only targets a specific section, "
         "you must return the full document with that section refined and all other sections intact. "
-        "Return ONLY the refined document content, no explanations or commentary."
+        "Return ONLY the refined document content, no explanations or commentary. "
+        "Do NOT wrap your output in markdown code fences."
     )
 
     try:
@@ -1415,6 +1573,19 @@ async def refine_stage_content(task_id: str, stage_num: int, request: ReleaseNot
         loop = asyncio.get_event_loop()
         with concurrent.futures.ThreadPoolExecutor() as executor:
             refined = await loop.run_in_executor(executor, _call_llm)
+
+        # Sanitize: strip markdown code fences if LLM wrapped the output
+        if refined:
+            refined = refined.strip()
+            refined = _strip_python_wrapper(refined)
+            # Strip leading ```markdown ... ``` wrapping
+            if refined.startswith("```") and refined.endswith("```"):
+                lines = refined.split("\n")
+                if len(lines) > 2:
+                    refined = "\n".join(lines[1:-1]).strip()
+            # Reject "None" / empty sentinels
+            if refined in ("None", "none", "null", "NULL", ""):
+                refined = None
 
         return ReleaseNotesRefineResponse(refined_content=refined or request.content)
     except Exception as e:
@@ -1528,6 +1699,10 @@ async def download_stage_pdf(task_id: str, stage_num: int, doc_key: str = None):
                 md_content = shared.get(doc_key)
             elif sdef.get("shared_key"):
                 md_content = shared.get(sdef["shared_key"])
+
+        # Reject file-write meta-messages from LLM
+        if md_content and _is_file_write_message(md_content):
+            md_content = None
 
         if not md_content:
             # Fall back to file on disk
@@ -1678,3 +1853,130 @@ async def delete_task(task_id: str):
             logger.warning("releasenotes_delete_workdir_failed path=%s error=%s", work_dir, exc)
 
     return {"status": "deleted", "task_id": task_id}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  GET /{task_id}/download-all — download all artifacts as ZIP
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("/{task_id}/download-all")
+async def download_all_artifacts(task_id: str):
+    """Download all generated artifacts as a single ZIP file."""
+    import zipfile
+
+    db = _get_db()
+    try:
+        from cmbagent.database.models import WorkflowRun
+        parent = db.query(WorkflowRun).filter(WorkflowRun.id == task_id).first()
+        if not parent:
+            raise HTTPException(status_code=404, detail="Task not found")
+        meta = parent.meta or {}
+        wd = meta.get("work_dir", _get_work_dir(task_id))
+        repo_name = meta.get("repo_name", "release-notes")
+    finally:
+        db.close()
+
+    input_dir = os.path.join(wd, "input_files")
+    if not os.path.isdir(input_dir):
+        raise HTTPException(status_code=404, detail="No artifacts found")
+
+    # Collect all markdown artifacts
+    artifact_files = [
+        "analysis_base.md",
+        "analysis_head.md",
+        "analysis_comparison.md",
+        "release_notes.md",
+        "migration_script.md",
+    ]
+
+    zip_name = f"{repo_name}_release_notes_package.zip"
+    zip_path = os.path.join(wd, zip_name)
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fname in artifact_files:
+            fp = os.path.join(input_dir, fname)
+            if os.path.exists(fp):
+                zf.write(fp, fname)
+
+        # Also include PDF versions if they exist
+        for fname in os.listdir(input_dir):
+            if fname.endswith(".pdf"):
+                fp = os.path.join(input_dir, fname)
+                zf.write(fp, fname)
+
+    if not os.path.exists(zip_path):
+        raise HTTPException(status_code=500, detail="Failed to create ZIP")
+
+    return FileResponse(
+        path=zip_path,
+        filename=zip_name,
+        media_type="application/zip",
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  GET /{task_id}/package-info — get package details for the Package panel
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("/{task_id}/package-info")
+async def get_package_info(task_id: str):
+    """Return artifact list and cost summary for the Package stage panel."""
+    db = _get_db()
+    try:
+        from cmbagent.database.models import WorkflowRun
+        parent = db.query(WorkflowRun).filter(WorkflowRun.id == task_id).first()
+        if not parent:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        meta = parent.meta or {}
+        wd = meta.get("work_dir", _get_work_dir(task_id))
+        repo_name = meta.get("repo_name", "release-notes")
+        session_id = parent.session_id
+
+        # Collect available artifacts from disk
+        input_dir = os.path.join(wd, "input_files")
+        artifact_defs = [
+            {"key": "analysis_base", "filename": "analysis_base.md", "label": "Last Release Branch Analysis", "stage_num": 2},
+            {"key": "analysis_head", "filename": "analysis_head.md", "label": "Current Release Branch Analysis", "stage_num": 2},
+            {"key": "analysis_comparison", "filename": "analysis_comparison.md", "label": "Detailed Comparison Report", "stage_num": 2},
+            {"key": "release_notes", "filename": "release_notes.md", "label": "Release Notes", "stage_num": 3},
+            {"key": "migration_script", "filename": "migration_script.md", "label": "Migration Script", "stage_num": 4},
+        ]
+
+        artifacts = []
+        for adef in artifact_defs:
+            fp = os.path.join(input_dir, adef["filename"]) if os.path.isdir(input_dir) else ""
+            if fp and os.path.exists(fp):
+                artifacts.append({
+                    "key": adef["key"],
+                    "filename": adef["filename"],
+                    "label": adef["label"],
+                    "stage_num": adef["stage_num"],
+                    "available": True,
+                })
+
+        # Collect cost
+        total_cost_usd = None
+        try:
+            cost_repo = _get_cost_repo(db, session_id=session_id)
+            cost_info = cost_repo.get_task_total_cost(parent_run_id=task_id)
+            total_cost_usd = cost_info.get("total_cost_usd")
+        except Exception:
+            pass
+
+        # Count completed stages
+        repo = _get_stage_repo(db, session_id=session_id)
+        stages = repo.list_stages(parent_run_id=task_id)
+        completed_stages = sum(1 for s in stages if s.status == "completed")
+        total_stages = len(stages)
+
+        return {
+            "task_id": task_id,
+            "repo_name": repo_name,
+            "artifacts": artifacts,
+            "total_cost_usd": total_cost_usd,
+            "completed_stages": completed_stages,
+            "total_stages": total_stages,
+        }
+    finally:
+        db.close()
